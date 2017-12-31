@@ -1,0 +1,159 @@
+#! /usr/bin/env python3
+
+import os, re
+from itertools import chain
+from datetime import datetime, timedelta, timezone
+from urllib.error import HTTPError, URLError, ContentTooShortError
+import urllib.request
+import shutil
+
+baseDir = os.path.dirname(__file__)
+downloadDir = os.path.join(baseDir, 'downloads')
+
+baseUrl = 'http://mirror.eu.oneandone.net/projects/media.ccc.de/congress/34c3/h264-hd/'
+serverUtcOffset = timedelta(hours=1)
+serverMonths = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'
+, 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+supportedLangs = ('deu', 'eng') # Acceptable audio track languages.
+
+def getNames():
+    """
+    Gets media file names from server.
+    """
+    with urllib.request.urlopen(baseUrl) as resp:
+        for line in resp:
+            line = line.decode('utf-8')
+            match = re.search(r'''<a\ href="(.+\.mp4)">[^<]+</a>\s*
+            ([0-9]{1,2})-([A-Z][a-z]{2})-([0-9]{4})\ 
+            ([0-9]{1,2}):([0-9]{1,2})\s+
+            ([1-9][0-9]{0,12})(\s|$)
+            ''', line, re.VERBOSE)
+            if match is not None:
+                name = match.group(1)
+                tsD, tsY = int(match.group(2)), int(match.group(4))
+                s = match.group(3)
+                if s in serverMonths:
+                    tsM = serverMonths.index(s) + 1
+                else:
+                    msg = "Timestamp contains invalid month!"
+                    raise ValueError(msg, ('matched string', match.group(0)))
+                tsh, tsm = int(match.group(5)), int(match.group(6))
+                tsO = datetime(tsY, tsM, tsD, tsh, tsm, tzinfo=timezone.utc)
+                ts = (tsO - serverUtcOffset).timestamp()
+                size = int(match.group(7))
+                yield name, ts, size
+
+def splitName(s):
+    """
+    Splits the media file name into prefix, suffix and a sequence of languages.
+    """
+    match = re.search(r'(^[^-]{4}-[^-]{4})-([a-z]{3}(?:-[a-z]{3})*)-(.*)$', s)
+    if match is None:
+        return None, (), None
+    return match.group(1), tuple(match.group(2).split('-')), match.group(3)
+
+def strOfTs(ts):
+    tsO = datetime.fromtimestamp(ts, timezone.utc)
+    return datetime.strftime(tsO, "%Y-%m-%d %H-%M UTC")
+
+def main():
+
+    # Get file names, split them and collect supported languages:
+    files = []
+    for name, ts, size in getNames():
+        prefix, langs, suffix = splitName(name)
+        langsF = tuple(lang for lang in langs if lang in supportedLangs)
+        if len(langsF) == 0:
+            print('No supported languages: {0}'.format(name))
+            continue
+        files.append((prefix, suffix, langs, langsF, ts, size))
+
+    # Collect all versions supporting at least one of our languages weighted by
+    # count of the languages in each version. Also try to detect the primary
+    # language of each recording:
+    mediaLangs = {}
+    mediaPrimaryLangs = {}
+    for prefix, suffix, langs, langsF, ts, size in files:
+        print(prefix, suffix, langs, langsF, ts, size)
+        langsRecord = mediaLangs.setdefault(prefix, {})
+        for lang in langsF:
+            l = langsRecord.setdefault(lang, [])
+            l.append((len(langs), langs, suffix, ts, size))
+        primarySupported = len(langsF) != 1 and langsF[0] in supportedLangs
+        if primarySupported:
+            mediaPrimaryLangs[prefix] = langsF[0]
+
+    # For each recording select the best supported version.
+    # Try to select the version containing the primary language and as few audio
+    # tracks as possible:
+    fileNames = []
+    for prefix, langsRecord in mediaLangs.items():
+        langP = mediaPrimaryLangs.get(prefix, None)
+        print()
+        print('selecting version for {0}:'.format(prefix))
+        versions = set(version[1] for version in chain(*langsRecord.values()))
+        print('Supported versions: {0}'.format(list(versions)))
+        if langP is None:
+            if all(len(version[1]) == 1 for version in chain(*langsRecord.values())):
+                msg = 'Only single-language versions available!'
+            else:
+                msg = 'Only synchronized versions available!'
+            print(msg.format(prefix))
+            versions = (version for version in chain(*langsRecord.values()))
+            _, langs, suffix, ts, size = sorted(versions)[0]
+        else:
+            msg = 'Original version available: {1}.'
+            print(msg.format(prefix, langP))
+            _, langs, suffix, ts, size = sorted(version for version in langsRecord[langP])[0]
+        print('Selected: {0}, {1}, {2}, {3}'.format(langs, suffix, strOfTs(ts), size))
+        fileName = '{0}-{1}-{2}'.format(prefix, '-'.join(langs), suffix)
+        fileNames.append((fileName, ts, size))
+        print()
+
+    # Create folder for selected files:
+    if not os.path.isdir(downloadDir):
+        os.mkdir(downloadDir)
+
+    # Download selected files:
+    for fileName, tsNew, sizeNew in sorted(fileNames):
+        fileUrl = baseUrl + fileName
+        filePath = os.path.join(downloadDir, fileName)
+
+        # Detect file changes by comparing timestamp and size:
+        toBeDownloaded = True
+        if os.path.isfile(filePath):
+            tsOld = os.path.getmtime(filePath)
+            sizeOld = os.path.getsize(filePath)
+            if tsOld < tsNew:
+                msg = "Old file's timestamp is older (old: {0}, new: {1}):"
+                msg = msg.format(strOfTs(tsOld), strOfTs(tsNew))
+            elif sizeOld != sizeNew:
+                msg = "Old file's size differs (old: {0}, new: {1}):"
+                msg = msg.format(sizeOld, sizeNew)
+            else:
+                # Not changed, process next.
+                toBeDownloaded = False
+                msg = "Old file is still up to date:"
+        else:
+            msg = "File is new:"
+        print(msg)
+        print("  {0}".format(fileUrl))
+        print("  {0}".format(filePath))
+        if not toBeDownloaded:
+            print("  Skipped.")
+            continue
+        print("  Downloading...")
+
+        # Download file:
+        with open(filePath, 'wb') as file:
+            try:
+                with urllib.request.urlopen(fileUrl) as response:
+                    shutil.copyfileobj(response, file)
+                print("  Done.")
+            except (HTTPError, URLError, ContentTooShortError) as ex:
+                msg = '  Error while downloading!'
+                print(msg.format(ex))
+                continue
+
+if __name__ == "__main__":
+    main()
